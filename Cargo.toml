@@ -8,4 +8,5 @@ path = "bevox.rs"
 
 [dependencies]
 bevy = "0.18"
+itertools = "0.13"
 
