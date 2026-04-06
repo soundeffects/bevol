@@ -3,9 +3,6 @@ name = "bevox"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-path = "bevox.rs"
-
 [dependencies]
 bevy = "0.18"
 itertools = "0.13"
