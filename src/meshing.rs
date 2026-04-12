@@ -1,4 +1,13 @@
 /*! # Meshing Module
+
+Handles mesh generation from voxel data using dual-contouring. The meshing algorithm
+operates on cells (voxels corners) and produces triangulated meshes suitable for
+Bevy rendering.
+
+The module provides:
+- [`Cell`] - A collection of 8 voxels representing cell corners for marching cubes-style algorithms
+- [`MeshTask`] - Async mesh generation task handle
+- [`mesh_cells`] - Core meshing function that transforms voxel cells into renderable meshes
 */
 
 use super::Voxel;
@@ -18,6 +27,9 @@ pub(crate) enum MeshTaskError {
 /// complete the mesh generation and return a Bevy [`Mesh`]. The mesh is produced using a
 /// dual-contouring algorithm, with vertex placement determined by a function passed in by the
 /// user when creating a [`Volume`] using [`Volume::generate`].
+///
+/// Internally wraps a Bevy async task that produces a Result, allowing proper error
+/// propagation when voxel data cannot be accessed (e.g., due to poison locks).
 #[derive(Component)]
 pub(crate) struct MeshTask(Task<Result<Mesh, MeshTaskError>>);
 
@@ -33,7 +45,39 @@ impl MeshTask {
     }
 }
 
-#[derive(Clone)]
+/// Represents the 8 corner voxels of a cell in the voxel grid, used for dual-contouring.
+///
+/// The naming follows the pattern: nx/px = negative/positive X, ny/py = negative/positive Y,
+/// nz/pz = negative/positive Z. For example, `nx_py_pz` is the corner at (-X, +Y, +Z).
+///
+/// Cells are the fundamental unit of meshing - each cell can potentially contain a surface
+/// if its voxels have mixed opacity (some opaque, some transparent).
+///
+/// # Example
+/// ```
+/// # use bevox::{Cell, StandardVoxel, Voxel};
+/// let cell = Cell {
+///     nx_ny_nz: StandardVoxel::new(0, -1.0),
+///     nx_ny_pz: StandardVoxel::new(0, -1.0),
+///     nx_py_nz: StandardVoxel::new(0, -1.0),
+///     nx_py_pz: StandardVoxel::new(0, -1.0),
+///     px_ny_nz: StandardVoxel::new(0, -1.0),
+///     px_ny_pz: StandardVoxel::new(0, -1.0),
+///     px_py_nz: StandardVoxel::new(0, -1.0),
+///     px_py_pz: StandardVoxel::new(0, -1.0),
+/// };
+/// // All voxels are transparent, so cell has no surface
+/// let all_transparent = cell.nx_ny_nz.opaque() == false
+///     && cell.nx_ny_pz.opaque() == false
+///     && cell.nx_py_nz.opaque() == false
+///     && cell.nx_py_pz.opaque() == false
+///     && cell.px_ny_nz.opaque() == false
+///     && cell.px_ny_pz.opaque() == false
+///     && cell.px_py_nz.opaque() == false
+///     && cell.px_py_pz.opaque() == false;
+/// assert!(all_transparent);
+/// ```
+#[derive(Clone, Default)]
 pub struct Cell<V: Voxel> {
     pub nx_ny_nz: V,
     pub nx_ny_pz: V,
@@ -46,6 +90,9 @@ pub struct Cell<V: Voxel> {
 }
 
 impl<V: Voxel> Cell<V> {
+    /// Returns all 8 corner voxels as an array, ordered by the bit pattern of the corner index.
+    ///
+    /// Index mapping: bit 0 = X (px), bit 1 = Y (py), bit 2 = Z (pz)
     pub(crate) fn fields(&self) -> [V; 8] {
         [
             self.nx_ny_nz,
@@ -59,6 +106,12 @@ impl<V: Voxel> Cell<V> {
         ]
     }
 
+    /// Returns true if this cell contains a surface, meaning some voxels are opaque
+    /// and some are transparent. This is the key check for determining if a cell
+    /// contributes to the mesh.
+    ///
+    /// A cell with uniform opacity (all opaque or all transparent) has no surface
+    /// and can be skipped during meshing.
     fn contains_surface(&self) -> bool {
         self.fields()
             .iter()
@@ -66,6 +119,17 @@ impl<V: Voxel> Cell<V> {
     }
 }
 
+/// Generates a renderable mesh from voxel cells using dual-contouring.
+///
+/// This function iterates through cells, filters those containing surfaces (mixed opacity),
+/// places vertices using the provided placer function, and builds triangle indices for rendering.
+///
+/// - `cells`: Iterator of (index, Cell) pairs representing the voxel grid positions
+/// - `placer`: Function that determines vertex position within each cell based on corner voxels
+/// - `flat`: If true, produces flat-shaded mesh by duplicating vertices per-face; otherwise
+///   shares vertices across faces for smooth shading
+///
+/// Returns a Bevy [`Mesh`] ready for rendering with computed normals.
 pub(crate) fn mesh_cells<V: Voxel>(
     cells: impl Iterator<Item = (UVec3, Cell<V>)>,
     placer: fn(Cell<V>) -> Vec3,
@@ -139,4 +203,58 @@ pub(crate) fn mesh_cells<V: Voxel>(
             .with_inserted_indices(Indices::U32(indices))
     }
     .with_computed_normals()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cell, Voxel};
+    use crate::{boxy_placer, StandardVoxel};
+
+    fn make_test_cell(has_surface: bool) -> Cell<StandardVoxel> {
+        if has_surface {
+            Cell {
+                nx_ny_nz: StandardVoxel::new(0, 1.0),
+                nx_ny_pz: StandardVoxel::new(0, 1.0),
+                nx_py_nz: StandardVoxel::new(0, 1.0),
+                nx_py_pz: StandardVoxel::new(0, 1.0),
+                px_ny_nz: StandardVoxel::new(0, -1.0),
+                px_ny_pz: StandardVoxel::new(0, -1.0),
+                px_py_nz: StandardVoxel::new(0, -1.0),
+                px_py_pz: StandardVoxel::new(0, -1.0),
+            }
+        } else {
+            Cell {
+                nx_ny_nz: StandardVoxel::new(0, 1.0),
+                nx_ny_pz: StandardVoxel::new(0, 1.0),
+                nx_py_nz: StandardVoxel::new(0, 1.0),
+                nx_py_pz: StandardVoxel::new(0, 1.0),
+                px_ny_nz: StandardVoxel::new(0, 1.0),
+                px_ny_pz: StandardVoxel::new(0, 1.0),
+                px_py_nz: StandardVoxel::new(0, 1.0),
+                px_py_pz: StandardVoxel::new(0, 1.0),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cell_contains_surface() {
+        let cell_with_surface = make_test_cell(true);
+        assert!(cell_with_surface.contains_surface());
+
+        let cell_without_surface = make_test_cell(false);
+        assert!(!cell_without_surface.contains_surface());
+    }
+
+    #[test]
+    fn test_cell_fields() {
+        let cell = make_test_cell(false);
+        let fields = cell.fields();
+        assert_eq!(fields.len(), 8);
+    }
+
+    #[test]
+    fn test_cell_default() {
+        let cell: Cell<StandardVoxel> = Cell::default();
+        assert!(!cell.contains_surface());
+    }
 }

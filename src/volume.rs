@@ -24,7 +24,8 @@ use std::sync::{Arc, RwLock};
 ///         # sampler,
 ///         # boxy_placer,
 ///         # GlobalTransform::IDENTITY,
-///         # 0
+///         # 0,
+///         false
 ///     ));
 /// }
 /// ```
@@ -60,7 +61,8 @@ impl<V: Voxel, const N: usize> GenerateTask<V, N> {
 ///         # sampler,
 ///         # boxy_placer,
 ///         # GlobalTransform::IDENTITY,
-///         # 0
+///         # 0,
+///         false
 ///     ));
 /// }
 /// ```
@@ -125,7 +127,8 @@ impl<V: Voxel + 'static, const N: usize> Volume<V, N> {
     ///         terrain_sampler,
     ///         bevox::boxy_placer,
     ///         GlobalTransform::from_translation(Vec3::ZERO),
-    ///         4 // depth of subdivisions
+    ///         4, // depth of subdivisions
+    ///         false
     ///     ));
     /// }
     /// ```
@@ -243,6 +246,7 @@ mod tests {
     use super::{Cell, GenerateTask, StandardVolume, Viewer, Volume, Voxel};
     use crate::StandardVoxel;
     use bevy::prelude::*;
+    use std::sync::{Arc, RwLock};
 
     fn test_sampler(_pos: Vec3) -> StandardVoxel {
         StandardVoxel::new(1, 1.0)
@@ -256,14 +260,7 @@ mod tests {
     fn make_test_volume(depth: u8) -> Volume<StandardVoxel, 8> {
         let voxels = [[[StandardVoxel::default(); 8]; 8]; 8];
         let voxel_store = Arc::new(RwLock::new(voxels));
-        Volume::from_voxel_store(
-            voxel_store,
-            test_sampler,
-            test_placer,
-            depth,
-            None,
-            false,
-        )
+        Volume::from_voxel_store(voxel_store, test_sampler, test_placer, depth, None, false)
     }
 
     #[test]
