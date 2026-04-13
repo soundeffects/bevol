@@ -10,6 +10,7 @@ use bevy::{
     ecs::entity_disabling::Disabled, platform::collections::HashSet, prelude::*,
     tasks::futures::check_ready,
 };
+use itertools::Itertools;
 
 /// Camera entities with the `Viewer` component determine the focal points of level-of-detail. When
 /// a camera has `Viewer` component, the plugin will automatically subdivide all [`Volume`]s within
@@ -165,7 +166,7 @@ fn poll_generate_task<V: Voxel, const N: usize>(
     generate_tasks: Query<(Entity, &mut GenerateTask<V, N>)>,
 ) {
     for (id, mut task) in generate_tasks {
-        if let Some(volume) = check_ready(task.task_mut()) {
+        if let Some(volume) = check_ready(task.inner_mut()) {
             commands
                 .entity(id)
                 .insert(volume)
@@ -189,7 +190,7 @@ fn poll_mesh_task(
     let mut not_finished = HashSet::new();
 
     for (id, mut task, disabled, _) in mesh_tasks.iter_mut() {
-        if let Some(Ok(mesh)) = check_ready(task.task_mut()) {
+        if let Some(Ok(mesh)) = check_ready(task.inner_mut()) {
             commands
                 .entity(id)
                 .insert((
@@ -213,7 +214,8 @@ fn poll_mesh_task(
         if disabled.is_some()
             && let Some(parent) = child_of.map(|child_of| child_of.parent())
             && let Ok(children) = children.get(parent)
-            && !children.iter().any(|child| not_finished.contains(&child)) {
+            && !children.iter().any(|child| not_finished.contains(&child))
+        {
             for child in children {
                 commands.entity(*child).remove::<Disabled>();
             }
@@ -231,36 +233,58 @@ fn poll_mesh_task(
 fn resample_volumes<V: Voxel, const N: usize>(
     mut commands: Commands,
     leaves: Query<(Entity, &Volume<V, N>, &GlobalTransform, Option<&ChildOf>), Without<Children>>,
-    branches: Query<(Entity, &Volume<V, N>, &GlobalTransform), (With<Children>, Without<MeshTask>)>,
+    branches: Query<(Entity, &Volume<V, N>, &GlobalTransform, &Children)>,
     viewers: Query<(&Viewer, &GlobalTransform)>,
+    mesh_task: Query<(), With<MeshTask>>,
     meshed: Query<(), With<Mesh3d>>,
 ) {
     let mut merging = HashSet::new();
-
-    for (id, volume, transform, parent) in leaves {
-        // When too close, a volume should subdivide
-        if volume.should_upsample(transform, viewers.iter()) {
-            commands.entity(id).with_children(|spawner| {
-                for bundle in volume.child_tasks(transform) {
-                    spawner.spawn(bundle);
-                }
-            });
-        }
-        // If there is a parent volume, and it has not already been marked for merging...
-        else if let Some((parent_id, parent_volume, parent_transform)) = parent
-            .filter(|parent| !merging.contains(&parent.parent()))
-            .and_then(|parent| branches.get(parent.parent()).ok())
-        {
-            // If the parent is too far away, it should merge, meaning it needs a mesh for itself
-            if !volume.should_upsample(parent_transform, viewers.iter()) {
-                // Adding a mesh task without a disabling component means a merge operation
-                commands.entity(parent_id).insert(parent_volume.mesh());
-                merging.insert(parent_id);
+    for (parent_id, parent_volume, parent_transform, children) in leaves
+        .iter()
+        .filter_map(|(_, _, _, child_of)| child_of)
+        .map(|child_of| child_of.parent())
+        .unique()
+        .filter_map(|parent| branches.get(parent).ok())
+    {
+        if !parent_volume.should_upsample(parent_transform, viewers.iter()) {
+            // Adding a mesh task without a disabling component means a merge operation
+            if let Some(mesh_task) = parent_volume.mesh() {
+                commands.entity(parent_id).insert(mesh_task);
             }
-            // Otherwise, if this child does not have a mesh, start a mesh task
-            else if meshed.get(id).is_err() {
+
+            for child in children {
+                commands
+                    .entity(*child)
+                    .remove::<MeshTask>()
+                    .remove::<GenerateTask<V, N>>();
+            }
+
+            merging.insert(parent_id);
+        } else {
+            commands.entity(parent_id).remove::<MeshTask>();
+        }
+    }
+
+    for (id, volume, transform, child_of) in leaves {
+        if child_of.is_some_and(|child_of| !merging.contains(&child_of.parent())) {
+            // When too close, a volume should subdivide
+            if volume.should_upsample(transform, viewers.iter()) {
+                commands.entity(id).with_children(|spawner| {
+                    for bundle in volume.child_tasks(transform) {
+                        spawner.spawn(bundle);
+                    }
+                });
+            }
+            // Otherwise, check if it needs a mesh
+            else if meshed.get(id).is_err()
+                && mesh_task.get(id).is_err()
+                && let Some(mesh_task) = volume.mesh()
+            {
+                commands.entity(id).insert(mesh_task);
                 // Adding a mesh task with a disabling component means a subdivision operation
-                commands.entity(id).insert((volume.mesh(), Disabled));
+                if child_of.is_some_and(|child_of| branches.get(child_of.parent()).is_ok()) {
+                    commands.entity(id).insert(Disabled);
+                }
             }
         }
     }
@@ -273,6 +297,7 @@ mod tests {
     use bevy::{
         core_pipeline::CorePipelinePlugin, mesh::MeshPlugin, pbr::PbrPlugin, render::RenderPlugin,
     };
+    use ntest::timeout;
 
     fn add_required_plugins(app: &mut App) {
         app.add_plugins((
@@ -284,6 +309,10 @@ mod tests {
             CorePipelinePlugin,
             PbrPlugin::default(),
         ));
+    }
+
+    fn test_sampler(_position: Vec3) -> StandardVoxel {
+        StandardVoxel::default()
     }
 
     #[test]
@@ -317,18 +346,15 @@ mod tests {
     }
 
     #[test]
+    #[timeout(10000)]
     fn test_polling_generate() {
         let mut app = App::new();
         add_required_plugins(&mut app);
         app.add_plugins(BevoxPlugin::for_parameters::<StandardVoxel, 16>());
         app.world_mut().run_schedule(Startup);
 
-        fn sampler(_position: Vec3) -> StandardVoxel {
-            StandardVoxel::default()
-        }
-
         app.world_mut().spawn(StandardVolume::generate(
-            sampler,
+            test_sampler,
             boxy_placer,
             GlobalTransform::default(),
             1,
@@ -338,7 +364,7 @@ mod tests {
         loop {
             app.world_mut().run_schedule(Update);
 
-            // Check if there exists a newly generated volume
+            // Check if there eventually exists a newly generated volume
             let mut query_state = app.world_mut().query::<&StandardVolume<StandardVoxel>>();
             if query_state.iter(app.world()).next().is_some() {
                 return;
@@ -346,8 +372,30 @@ mod tests {
         }
     }
 
-    // TODO: test polling incomplete and complete `MeshTask` for both subdivide and merge
-    // operations; test subdividing, merging, mesh task, and no-op in `resample_volumes` for
-    // various viewer setups.
-}
+    #[test]
+    #[timeout(10000)]
+    fn test_polling_mesh() {
+        let mut app = App::new();
+        add_required_plugins(&mut app);
+        app.add_plugins(BevoxPlugin::for_parameters::<StandardVoxel, 16>());
+        app.world_mut().run_schedule(Startup);
 
+        app.world_mut().spawn(StandardVolume::generate(
+            test_sampler,
+            boxy_placer,
+            GlobalTransform::default(),
+            1,
+            false,
+        ));
+
+        loop {
+            app.world_mut().run_schedule(Update);
+
+            // Check if there eventually exists a newly generated mesh
+            let mut query_state = app.world_mut().query::<&Mesh3d>();
+            if query_state.iter(app.world()).next().is_some() {
+                return;
+            }
+        }
+    }
+}

@@ -7,3 +7,6 @@ edition = "2024"
 bevy = { version = "0.18", features = ["debug"] }
 itertools = "0.13"
 
+[dev-dependencies]
+ntest = "0.9.5"
+

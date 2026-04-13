@@ -23,6 +23,7 @@ pub(crate) enum MeshTaskError {
     PoisonedRwLock,
 }
 
+//TODO: move MeshTask to volume module
 /// A task handle for an asynchronously generated [`Mesh`]. When polled, the task will
 /// complete the mesh generation and return a Bevy [`Mesh`]. The mesh is produced using a
 /// dual-contouring algorithm, with vertex placement determined by a function passed in by the
@@ -40,7 +41,7 @@ impl MeshTask {
         Self(AsyncComputeTaskPool::get().spawn(async_function))
     }
 
-    pub(crate) fn task_mut(&mut self) -> &mut Task<Result<Mesh, MeshTaskError>> {
+    pub(crate) fn inner_mut(&mut self) -> &mut Task<Result<Mesh, MeshTaskError>> {
         &mut self.0
     }
 }

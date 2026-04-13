@@ -1,4 +1,6 @@
 /*! # Volume Module
+This module implements [`Volume`] and [`GenerateTask`] structs, which store blocks of voxel data
+and which handle the generation of voxel data, respectively.
 */
 
 use super::{mesh_cells, Cell, MeshTask, MeshTaskError, Viewer, Voxel};
@@ -25,7 +27,7 @@ use std::sync::{Arc, RwLock};
 ///         # boxy_placer,
 ///         # GlobalTransform::IDENTITY,
 ///         # 0,
-///         false
+///         # false
 ///     ));
 /// }
 /// ```
@@ -33,13 +35,21 @@ use std::sync::{Arc, RwLock};
 pub struct GenerateTask<V: Voxel + 'static, const N: usize>(Task<Volume<V, N>>);
 
 impl<V: Voxel, const N: usize> GenerateTask<V, N> {
-    pub(crate) fn task_mut(&mut self) -> &mut Task<Volume<V, N>> {
+    pub(crate) fn inner_mut(&mut self) -> &mut Task<Volume<V, N>> {
         &mut self.0
     }
 }
 
+#[derive(Clone)]
+pub struct VolumeConfig<V: Voxel> {
+    pub sampler: fn(Vec3) -> V,
+    pub placer: fn(Cell<V>) -> Vec3,
+    pub depth: u8,
+    pub flat_normals: bool,
+}
+
 /// A cubical grid of voxels, also known as a "chunk". Will automatically be subdivided
-/// (octree-style) by [`VoxelsPlugin`] systems.
+/// (octree-style) by the [`BevoxPlugin`](crate::BevoxPlugin).
 ///
 /// - Stores a sampling function to determine voxel values at generation, which it will pass on
 ///   to any subdivided children.
@@ -62,7 +72,7 @@ impl<V: Voxel, const N: usize> GenerateTask<V, N> {
 ///         # boxy_placer,
 ///         # GlobalTransform::IDENTITY,
 ///         # 0,
-///         false
+///         # false
 ///     ));
 /// }
 /// ```
@@ -70,11 +80,8 @@ impl<V: Voxel, const N: usize> GenerateTask<V, N> {
 #[require(GlobalTransform)]
 pub struct Volume<V: Voxel + 'static, const N: usize> {
     voxel_store: Arc<RwLock<[[[V; N]; N]; N]>>,
-    sampler: fn(Vec3) -> V,
-    placer: fn(Cell<V>) -> Vec3,
-    depth: u8,
-    trivial_opacity: Option<bool>,
-    flat_normals: bool,
+    trivial_opacity: bool,
+    config: VolumeConfig<V>,
 }
 
 /// This is a [`Volume`] with a set cubical length of 16 voxels. It can be used in all the same
@@ -82,31 +89,15 @@ pub struct Volume<V: Voxel + 'static, const N: usize> {
 pub type StandardVolume<V> = Volume<V, 16>;
 
 impl<V: Voxel + 'static, const N: usize> Volume<V, N> {
-    pub(crate) fn from_voxel_store(
-        voxel_store: Arc<RwLock<[[[V; N]; N]; N]>>,
-        sampler: fn(Vec3) -> V,
-        placer: fn(Cell<V>) -> Vec3,
-        depth: u8,
-        trivial_opacity: Option<bool>,
-        flat_normals: bool,
-    ) -> Self {
-        Self {
-            voxel_store,
-            sampler,
-            placer,
-            depth,
-            trivial_opacity,
-            flat_normals,
-        }
-    }
-    /// Generate a new `Volume` using the following:
+    /// Generate a new [`Volume`] using the following:
     /// - A 3D sampling function to determine voxel values
     /// - A vertex-placing function used to place vertices on the dual grid when meshing
-    /// - A [`GlobalTransform`] to signal where this `Volume` is placed
+    /// - A [`GlobalTransform`] to signal where this [`Volume`] is placed
     /// - A depth used to limit the number of subdivisions
     /// - Specify the generic [`Voxel`] and `N` (volume size)
     ///
-    /// Returns a [`GenerateTask`] component which will asynchronously produce the `Volume`.
+    /// Returns a [`GenerateTask`] component which will asynchronously produce the [`Volume`], as
+    /// long as the [`BevoxPlugin`](crate::BevoxPlugin) has been added to the Bevy app.
     ///
     /// # Example
     /// ```
@@ -132,54 +123,43 @@ impl<V: Voxel + 'static, const N: usize> Volume<V, N> {
     ///     ));
     /// }
     /// ```
-    pub fn generate(
-        sampler: fn(Vec3) -> V,
-        placer: fn(Cell<V>) -> Vec3,
-        transform: GlobalTransform,
-        depth: u8,
-        flat_normals: bool,
-    ) -> GenerateTask<V, N> {
+    pub fn generate(transform: GlobalTransform, config: VolumeConfig<V>) -> GenerateTask<V, N> {
         let task = AsyncComputeTaskPool::get().spawn(async move {
             let mut voxels = [[[V::default(); N]; N]; N];
 
+            let mut nontrivial_opacity = false;
             for (x, y, z) in iproduct!(0..N, 0..N, 0..N) {
                 let offset = Vec3::splat(0.5 - 1. / (2.0 * N as f32));
                 let position = Vec3::new(x as f32, y as f32, z as f32);
-                voxels[x][y][z] = sampler(transform.transform_point(position - offset));
+                voxels[x][y][z] = (config.sampler)(transform.transform_point(position - offset));
+                nontrivial_opacity |= voxels[0][0][0].opaque() != voxels[x][y][z].opaque();
             }
-
-            let trivial_opacity = iproduct!(0..N, 0..N, 0..N)
-                .map(|(x, y, z)| voxels[x][y][z])
-                .all(|voxel| voxel.opaque() == voxels[0][0][0].opaque())
-                .then_some(voxels[0][0][0].opaque());
 
             Self {
                 voxel_store: Arc::new(RwLock::new(voxels)),
-                sampler,
-                placer,
-                depth,
-                trivial_opacity,
-                flat_normals,
+                trivial_opacity: !nontrivial_opacity,
+                config,
             }
         });
         GenerateTask(task)
     }
 
-    /// Volume should subdivide if they are close to viewers, have not reached maximum
+    /// [`Volume`]s should subdivide if they are close to [`Viewer`]s, have not reached maximum
     /// subdivision depth, and are not a trivial volume with no surface cells.
     pub(crate) fn should_upsample<'a>(
         &self,
         transform: &GlobalTransform,
         mut viewers: impl Iterator<Item = (&'a Viewer, &'a GlobalTransform)>,
     ) -> bool {
-        viewers
-            .any(|(viewer, viewer_transform)| viewer.should_upsample(viewer_transform, transform))
-            && self.depth > 0
-            && self.trivial_opacity.is_none()
+        !self.trivial_opacity
+            && self.config.depth > 0
+            && viewers.any(|(viewer, viewer_transform)| {
+                viewer.should_upsample(viewer_transform, transform)
+            })
     }
 
-    /// Create a set async tasks to generate eight subdivided children of this volume, each
-    /// governing an octant of this volume's cubical region. Provide the transformation
+    /// Create a set async tasks to generate eight subdivided children of this [`Volume`], each
+    /// governing an octant of this [`Volume`]'s cubical region. Provide the transformation
     /// representing the offset with each task.
     pub(crate) fn child_tasks(
         &self,
@@ -193,29 +173,31 @@ impl<V: Voxel + 'static, const N: usize> Volume<V, N> {
             ))
             .with_scale(Vec3::splat(0.5));
             let child_transform = transform.mul_transform(relative_transform);
+            let mut child_config = self.config.clone();
+            child_config.depth -= 1;
             (
-                Self::generate(
-                    self.sampler,
-                    self.placer,
-                    child_transform,
-                    self.depth - 1,
-                    self.flat_normals,
-                ),
+                Self::generate(child_transform, child_config),
                 relative_transform,
             )
         })
     }
 
-    /// Produces a [`Mesh`] for this `Volume` asynchronously. This mesh will only contain
-    /// interior surface data, and not any border regions where the `Volume` interfaces with
-    /// neighboring `Volume`s.
-    pub(crate) fn mesh(&self) -> MeshTask {
-        let placer = self.placer;
-        let flat_normals = self.flat_normals;
+    /// Produces a [`Mesh`] for this [`Volume`] asynchronously, if it does not have a trivial
+    /// opacity (all opaque or all transparent values, as defined by [`Voxel`]). This mesh will
+    /// only contain interior surface data, and not any border regions where the [`Volume`]
+    /// interfaces with neighboring [`Volume`]s.
+    pub(crate) fn mesh(&self) -> Option<MeshTask> {
+        if self.trivial_opacity {
+            return None;
+        }
+
+        let placer = self.config.placer;
+        let flat_normals = self.config.flat_normals;
         let voxel_lock = self.voxel_store.clone();
 
-        MeshTask::new(async move {
+        Some(MeshTask::new(async move {
             match voxel_lock.read() {
+                // TODO: Move the cell iterator logic to the meshing volume
                 Ok(voxels) => Ok(mesh_cells(
                     iproduct!(0..(N - 1), 0..(N - 1), 0..(N - 1)).map(|(x, y, z)| {
                         (
@@ -237,7 +219,7 @@ impl<V: Voxel + 'static, const N: usize> Volume<V, N> {
                 )),
                 Err(_) => Err(MeshTaskError::PoisonedRwLock),
             }
-        })
+        }))
     }
 }
 
